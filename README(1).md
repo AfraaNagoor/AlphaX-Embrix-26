@@ -71,6 +71,9 @@ A lightweight machine-learning model analyses the extracted features and classif
 The classification result is presented locally using the OLED display, LED, and buzzer.
 
 ---
+## Project Demonstration
+
+[Watch the Project Demonstration](https://drive.google.com/file/d/1xCJO7SRnJ9L2kEtbfsUy3xUVL-je-eVf/view?usp=sharing)
 
 ## System Architecture
 
