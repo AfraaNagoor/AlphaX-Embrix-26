@@ -174,7 +174,6 @@ The external microphone provides a reference for the surrounding acoustic enviro
 - Scikit-learn
 - SoundFile
 - Librosa
-- Matplotlib
 
 ---
 
@@ -265,26 +264,51 @@ The prototype is a detection aid and is not intended to replace complete warehou
 
 ---
 
-## Research References
+## Research Progression and References
 
-1. Mankin et al. (2020), *Performance of a Low-Cost Acoustic Insect Detector System with Sitophilus oryzae in Stored Grain*  
-   https://doi.org/10.1093/jee/toaa203
+The development of this project is supported by research spanning acoustic propagation, bioacoustic detection, low-cost sensing, signal processing, and noise-robust insect detection.
 
-2. Hickling, Wei and Hagstrum (1997), *Studies of Sound Transmission in Various Types of Stored Grain for Acoustic Detection of Insects*  
-   https://doi.org/10.1016/S0003-682X(96)00041-2
+### 1997
+**Hickling, Wei and Hagstrum**  
+*Studies of Sound Transmission in Various Types of Stored Grain for Acoustic Detection of Insects*  
+[ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0003682X96000412)
 
-3. Kadyrov et al. (2024), *Vibro-Acoustic Signatures of Various Insects in Stored Products*  
-   https://doi.org/10.3390/s24206736
+**Key contribution:** Understanding acoustic propagation and attenuation in different grains.
 
-4. Kadyrov et al. (2026), *Acoustic Detection of Insects in Stored Products in the Presence of Strong Ambient Noise*  
-   https://doi.org/10.3390/s26051511
+### 2016
+**Eliopoulos, Potamitis and Kontodimas**  
+*Estimation of Population Density of Stored Grain Pests via Bioacoustic Detection*  
+[ScienceDirect](https://www.sciencedirect.com/science/article/abs/pii/S0261219416300618)
 
-5. Balingbing et al. (2024), *Application of a Multi-Layer Convolutional Neural Network Model to Classify Major Insect Pests in Stored Rice Detected by an Acoustic Device*  
-   https://doi.org/10.1016/j.compag.2024.109297
+**Key contribution:** Combining acoustic sensing with machine learning for infestation-density estimation.
 
-6. Shuman et al. (1993), *Quantitative Acoustical Detection of Larvae Feeding Inside Kernels of Grain*  
-   https://doi.org/10.1093/jee/86.3.933
+### 2020
+**Mankin, Jetter, Rohde and Yasir**  
+*Stored-Product Performance of a Low-Cost Acoustic Insect Detector System*  
+[Oxford Academic](https://academic.oup.com/jee/article-abstract/113/6/3004/5910423)
 
+**Key contribution:** Low-cost microcontroller-based acoustic insect detection.
+
+### 2021
+**Mankin et al.**  
+*Automated Applications of Acoustics for Stored Product Insect Detection, Monitoring, and Management*  
+[MDPI](https://www.mdpi.com/2075-4450/12/3/259)
+
+**Key contribution:** Review of acoustic sensing, automation, signal processing, and insect monitoring.
+
+### 2024
+**Kadyrov et al.**  
+*Vibro-Acoustic Signatures of Various Insects in Stored Products*  
+[MDPI](https://www.mdpi.com/1424-8220/24/20/6736)
+
+**Key contribution:** Multi-sensor vibro-acoustic characterization and signal normalization.
+
+### 2026
+**Kadyrov et al.**  
+*Acoustic Detection of Insects in Stored Products in the Presence of Strong Ambient Noise*  
+[MDPI](https://www.mdpi.com/1424-8220/26/5/1511)
+
+**Key contribution:** Improved insect detection under strong ambient noise.
 ---
 
 ## Suggested Repository Structure
@@ -321,7 +345,3 @@ This is an experimental prototype. Detection performance depends on probe coupli
 A classification result should be interpreted as the output of the sensing system and should not by itself be treated as proof of a specific insect species or complete infestation coverage.
 
 ---
-
-## License
-
-Add an appropriate license for the repository based on the project's software, hardware, dataset, and research-use requirements.
