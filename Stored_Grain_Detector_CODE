@@ -1,0 +1,1154 @@
+﻿/*
+  ========================================================================================
+  Project: Offline Acoustic Detection of Hidden Insect Infestation in Stored Grains
+  Target:  ARIES Vega V2.0 (CDAC RISC-V THEJAS Core)
+  IDE:     Arduino IDE 2.3.x / ARIES Vega Board Package (vega:riscv:aries_v2)
+  ========================================================================================
+
+  HARDWARE ASSIGNMENTS:
+    - A0 = Lower Stainless-Steel Probe + Piezo AFE (P1)
+    - A1 = Upper Stainless-Steel Probe + Piezo AFE (P2)
+    - A2 = MAX4466 Microphone AFE (Ambient Acoustic Reference)
+    - GPIO11 = Green LED (NORMAL)
+    - GPIO12 = Yellow LED (INSECT ACTIVITY)
+    - GPIO13 = Red LED (EXTERNAL DISTURBANCE)
+    - GPIO14 = Active 5V Buzzer via 2N2222A Transistor Driver
+    - GPIO15 = Push Button for Mute / Reset (INPUT_PULLUP)
+    - I2C (SCL/SDA) = 0.96" SSD1306 OLED Display (Address 0x3C)
+
+  KEY DESIGN & ARIES VEGA V2 COMPATIBILITY HIGHLIGHTS:
+    1. TwoWire Wire(0) explicitly instantiated:
+       In the ARIES Vega core library, TwoWire Wire(0) is commented out in Wire.cpp,
+       requiring user code to instantiate the bus object directly.
+    2. 16-byte I2C FIFO Buffer Safety:
+       The SSD1306 driver sends display data strictly in 8-byte chunks (+1 command byte
+       = 9 bytes total per transmission) to avoid hardware FIFO overflow.
+    3. Completely Self-Contained:
+       No external OLED or FFT libraries required; no AVR-only functions (dtostrf, ltoa);
+       no ESP32-only calls. Runs deterministically on RISC-V.
+    4. Windowed DSP Pipeline:
+       - Synchronous 128-point acquisition of P1, P2, and MIC.
+       - Independent DC baseline calibration and quiet noise floor tracking.
+       - Hann windowing + fast in-place Radix-2 FFT.
+       - 15 time-domain, spectral, and temporal event features calculated per window.
+    5. Four-Scenario Real Hardware Discrimination:
+       - Normal grain: Probes and mic quiet, Green LED ON, Buzzer OFF.
+       - Real insect activity: Localized small/medium mechanical bursts (sensitive to
+         ~170 count excursions on lower probe), high probe-to-mic ratio, repeated
+         transient clicks confirming across multiple windows.
+       - Container knock / tap / handling: High-crest synchronized dual-probe shock +
+         loud microphone impulse -> classified as EXTERNAL DISTURBANCE, never INSECT.
+       - Environmental noise / speech / clapping: Loud microphone alone without probe
+         vibrations is rejected and stays NORMAL.
+  ========================================================================================
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <math.h>
+
+// ARIES Vega V2: Explicitly instantiate I2C controller 0
+TwoWire Wire(0);
+
+// Pin Definitions
+#define P1_PIN        A0   // Lower probe piezo AFE
+#define P2_PIN        A1   // Upper probe piezo AFE
+#define MIC_PIN       A2   // Ambient MAX4466 microphone AFE
+
+#define LED_GREEN     11   // NORMAL indicator
+#define LED_YELLOW    12   // INSECT indicator
+#define LED_RED       13   // EXTERNAL indicator
+#define BUZZER_PIN    14   // Active 5V buzzer via 2N2222A driver
+#define BUTTON_PIN    15   // Push button to GND (mute / reset)
+
+#define OLED_ADDR     0x3C // SSD1306 default I2C address
+
+// Constants & Parameters
+const uint16_t WINDOW_SIZE      = 128; // Power of 2 for FFT
+const uint16_t FFT_SIZE         = 128;
+const uint16_t FFT_HALF         = 64;  // Usable spectral bins (Nyquist limit)
+const uint8_t  HISTORY_LEN      = 8;   // Rolling window history depth
+const uint16_t CAL_SAMPLES      = 300; // Startup calibration samples
+const uint32_t EXTERNAL_HOLD_MS = 2500;// Alert hold time for external shock (ms)
+const float    EPS              = 0.0001f;
+
+// States
+enum SystemState {
+  STATE_NORMAL   = 0,
+  STATE_INSECT   = 1,
+  STATE_EXTERNAL = 2
+};
+
+struct ChannelFeatures {
+  float    mean;
+  float    rms;
+  float    peak;
+  float    crest;
+  float    activity;        // rms / noiseFloor
+  float    specEnergy;      // Total spectral energy (bins 1..64)
+  float    dominantFreq;    // Peak frequency in Hz
+  float    centroid;        // Spectral centroid in Hz
+  float    spread;          // Spectral spread / bandwidth in Hz
+  float    bandLow;         // Band 1 (low frequencies)
+  float    bandMid;         // Band 2 (mid grain acoustic resonance)
+  float    bandHigh;        // Band 3 (high frequencies)
+  uint16_t events;          // Discrete transient bursts in window
+  float    eventDuration;   // Average event duration in samples
+  float    eventInterval;   // Average sample gap between events
+};
+
+struct ScoreBreakdown {
+  float temporal;
+  float spatial;
+  float spectral;
+  float ambientRejection;
+  float recurrence;
+  float totalInsect;
+
+  float impulse;
+  float simultaneousProbe;
+  float microphone;
+  float totalExternal;
+
+  float spatialImbalance;
+  float ambientDominance;
+  float probeRatio;
+};
+
+// System Variables
+SystemState currentState = STATE_NORMAL;
+
+int16_t bufP1[WINDOW_SIZE];
+int16_t bufP2[WINDOW_SIZE];
+int16_t bufMic[WINDOW_SIZE];
+
+float hannWindow[FFT_SIZE];
+float fftRe[FFT_SIZE];
+float fftIm[FFT_SIZE];
+float fftMag[FFT_HALF + 1];
+
+// Per-channel baseline (resting DC) and quiet noise floor
+float baseP1 = 0.0f;
+float baseP2 = 0.0f;
+float baseMic = 0.0f;
+
+float noiseFloorP1 = 2.0f;
+float noiseFloorP2 = 2.0f;
+float noiseFloorMic = 2.0f;
+
+float quietEnergyP1 = 10.0f;
+float quietEnergyP2 = 10.0f;
+float quietEnergyMic = 10.0f;
+
+ChannelFeatures featP1;
+ChannelFeatures featP2;
+ChannelFeatures featMic;
+ScoreBreakdown scores;
+
+uint8_t  insectHistory[HISTORY_LEN];
+uint8_t  historyIndex = 0;
+uint8_t  recentInsectVotes = 0;
+
+uint8_t  insectConfirmCount = 0;
+uint32_t externalHoldUntil = 0;
+bool     insectLatched = false;
+bool     alarmMuted = false;
+uint32_t lastButtonPressMs = 0;
+
+bool     buzzerPinState = false;
+uint32_t buzzerNextToggleMs = 0;
+
+uint32_t windowCounter = 0;
+float    effectiveSampleRate = 600.0f;
+
+// Refresh OLED less often than the DSP engine so I2C traffic does not
+// make sudden sensor changes look delayed.
+uint32_t lastOLEDUpdateMs = 0;
+const uint32_t OLED_UPDATE_MS = 180UL;
+
+
+// ========================================================================================
+// SSD1306 0.96" I2C OLED MINIMAL DRIVER (ARIES VEGA V2 SAFE)
+// ========================================================================================
+uint8_t oledBuffer[128 * 64 / 8]; // 1024 bytes frame buffer
+
+// Embedded ASCII 5x7 font table (chars 32 ' ' through 126 '~')
+static const uint8_t font5x7[95 * 5] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x00, 0x00, 0x00, 0x07, 0x00, 0x07, 0x00,
+  0x14, 0x7F, 0x14, 0x7F, 0x14, 0x24, 0x2A, 0x7F, 0x2A, 0x12, 0x23, 0x13, 0x08, 0x64, 0x62,
+  0x36, 0x49, 0x56, 0x20, 0x50, 0x00, 0x08, 0x07, 0x03, 0x00, 0x00, 0x1C, 0x22, 0x41, 0x00,
+  0x00, 0x41, 0x22, 0x1C, 0x00, 0x2A, 0x1C, 0x7F, 0x1C, 0x2A, 0x08, 0x08, 0x3E, 0x08, 0x08,
+  0x00, 0x80, 0x70, 0x30, 0x00, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00, 0x60, 0x60, 0x00,
+  0x20, 0x10, 0x08, 0x04, 0x02, 0x3E, 0x51, 0x49, 0x45, 0x3E, 0x00, 0x42, 0x7F, 0x40, 0x00,
+  0x72, 0x49, 0x49, 0x49, 0x46, 0x21, 0x41, 0x49, 0x4D, 0x33, 0x18, 0x14, 0x12, 0x7F, 0x10,
+  0x27, 0x45, 0x45, 0x45, 0x39, 0x3C, 0x4A, 0x49, 0x49, 0x31, 0x41, 0x21, 0x11, 0x09, 0x07,
+  0x36, 0x49, 0x49, 0x49, 0x36, 0x46, 0x49, 0x49, 0x29, 0x1E, 0x00, 0x00, 0x14, 0x00, 0x00,
+  0x00, 0x40, 0x34, 0x00, 0x00, 0x00, 0x08, 0x14, 0x22, 0x41, 0x14, 0x14, 0x14, 0x14, 0x14,
+  0x00, 0x41, 0x22, 0x14, 0x08, 0x02, 0x01, 0x59, 0x09, 0x06, 0x3E, 0x41, 0x5D, 0x59, 0x4E,
+  0x7C, 0x12, 0x11, 0x12, 0x7C, 0x7F, 0x49, 0x49, 0x49, 0x36, 0x3E, 0x41, 0x41, 0x41, 0x22,
+  0x7F, 0x41, 0x41, 0x41, 0x3E, 0x7F, 0x49, 0x49, 0x49, 0x41, 0x7F, 0x09, 0x09, 0x09, 0x01,
+  0x3E, 0x41, 0x41, 0x51, 0x73, 0x7F, 0x08, 0x08, 0x08, 0x7F, 0x00, 0x41, 0x7F, 0x41, 0x00,
+  0x20, 0x40, 0x41, 0x3F, 0x01, 0x7F, 0x08, 0x14, 0x22, 0x41, 0x7F, 0x40, 0x40, 0x40, 0x40,
+  0x7F, 0x02, 0x1C, 0x02, 0x7F, 0x7F, 0x04, 0x08, 0x10, 0x7F, 0x3E, 0x41, 0x41, 0x41, 0x3E,
+  0x7F, 0x09, 0x09, 0x09, 0x06, 0x3E, 0x41, 0x51, 0x21, 0x5E, 0x7F, 0x09, 0x19, 0x29, 0x46,
+  0x26, 0x49, 0x49, 0x49, 0x32, 0x03, 0x01, 0x7F, 0x01, 0x03, 0x3F, 0x40, 0x40, 0x40, 0x3F,
+  0x1F, 0x20, 0x40, 0x20, 0x1F, 0x3F, 0x40, 0x38, 0x40, 0x3F, 0x63, 0x14, 0x08, 0x14, 0x63,
+  0x03, 0x04, 0x78, 0x04, 0x03, 0x61, 0x59, 0x49, 0x4D, 0x43, 0x00, 0x7F, 0x41, 0x41, 0x41,
+  0x02, 0x04, 0x08, 0x10, 0x20, 0x00, 0x41, 0x41, 0x41, 0x7F, 0x04, 0x02, 0x01, 0x02, 0x04,
+  0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x03, 0x07, 0x08, 0x00, 0x20, 0x54, 0x54, 0x78, 0x40,
+  0x7F, 0x28, 0x44, 0x44, 0x38, 0x38, 0x44, 0x44, 0x44, 0x28, 0x38, 0x44, 0x44, 0x28, 0x7F,
+  0x38, 0x54, 0x54, 0x54, 0x18, 0x00, 0x08, 0x7E, 0x09, 0x02, 0x18, 0xA4, 0xA4, 0x9C, 0x78,
+  0x7F, 0x08, 0x04, 0x04, 0x78, 0x00, 0x44, 0x7D, 0x40, 0x00, 0x20, 0x40, 0x40, 0x3D, 0x00,
+  0x7F, 0x10, 0x28, 0x44, 0x00, 0x00, 0x41, 0x7F, 0x40, 0x00, 0x7C, 0x04, 0x78, 0x04, 0x78,
+  0x7C, 0x08, 0x04, 0x04, 0x78, 0x38, 0x44, 0x44, 0x44, 0x38, 0xFC, 0x18, 0x24, 0x24, 0x18,
+  0x18, 0x24, 0x24, 0x18, 0xFC, 0x7C, 0x08, 0x04, 0x04, 0x08, 0x48, 0x54, 0x54, 0x54, 0x24,
+  0x04, 0x04, 0x3F, 0x44, 0x24, 0x3C, 0x40, 0x40, 0x20, 0x7C, 0x1C, 0x20, 0x40, 0x20, 0x1C,
+  0x3C, 0x40, 0x30, 0x40, 0x3C, 0x44, 0x28, 0x10, 0x28, 0x44, 0x4C, 0x90, 0x90, 0x90, 0x7C,
+  0x44, 0x64, 0x54, 0x4C, 0x44, 0x00, 0x08, 0x36, 0x41, 0x00, 0x00, 0x00, 0x77, 0x00, 0x00,
+  0x00, 0x41, 0x36, 0x08, 0x00, 0x02, 0x01, 0x02, 0x04, 0x02,};
+
+void oledCommand(uint8_t c) {
+  Wire.beginTransmission(OLED_ADDR);
+  Wire.write(0x00);
+  Wire.write(c);
+  Wire.endTransmission();
+}
+
+void oledInit() {
+  Wire.begin();
+  delay(30);
+
+  const uint8_t initCommands[] = {
+    0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00,
+    0x40, 0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8,
+    0xDA, 0x12, 0x81, 0xCF, 0xD9, 0xF1, 0xDB,
+    0x40, 0xA4, 0xA6, 0xAF
+  };
+
+  for (size_t i = 0; i < sizeof(initCommands); i++) {
+    oledCommand(initCommands[i]);
+  }
+
+  memset(oledBuffer, 0, sizeof(oledBuffer));
+}
+
+void oledClear() {
+  memset(oledBuffer, 0, sizeof(oledBuffer));
+}
+
+void oledPixel(int x, int y, bool on) {
+  if (x < 0 || x >= 128 || y < 0 || y >= 64) return;
+  uint16_t idx = x + (y / 8) * 128;
+  uint8_t mask = (uint8_t)(1U << (y & 7));
+  if (on) oledBuffer[idx] |= mask;
+  else    oledBuffer[idx] &= (uint8_t)~mask;
+}
+
+void oledChar(int x, int y, char c) {
+  if (c < 32 || c > 126) c = ' ';
+  uint16_t fontOffset = (uint16_t)(c - 32) * 5;
+  for (uint8_t col = 0; col < 5; ++col) {
+    uint8_t line = font5x7[fontOffset + col];
+    for (uint8_t row = 0; row < 7; ++row) {
+      if (line & (1U << row)) {
+        oledPixel(x + col, y + row, true);
+      }
+    }
+  }
+}
+
+void oledText(int x, int y, const char *str) {
+  while (*str && x <= 122) {
+    oledChar(x, y, *str++);
+    x += 6;
+  }
+}
+
+void oledInt(int x, int y, long val) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%ld", val);
+  oledText(x, y, buf);
+}
+
+void oledFloat(int x, int y, float val, int decimals) {
+  char buf[24];
+  int k = 0;
+  if (val < 0.0f) {
+    buf[k++] = '-';
+    val = -val;
+  }
+  long whole = (long)val;
+  float remainder = val - (float)whole;
+
+  char tmp[16];
+  int t = 0;
+  if (whole == 0) {
+    tmp[t++] = '0';
+  } else {
+    while (whole > 0 && t < 15) {
+      tmp[t++] = (char)('0' + (whole % 10));
+      whole /= 10;
+    }
+  }
+  while (t > 0) {
+    buf[k++] = tmp[--t];
+  }
+
+  if (decimals > 0) {
+    buf[k++] = '.';
+    for (int d = 0; d < decimals; d++) {
+      remainder *= 10.0f;
+      int digit = (int)remainder;
+      buf[k++] = (char)('0' + digit);
+      remainder -= (float)digit;
+    }
+  }
+  buf[k] = '\0';
+  oledText(x, y, buf);
+}
+
+void oledShow() {
+  for (uint8_t page = 0; page < 8; ++page) {
+    oledCommand((uint8_t)(0xB0 | page));
+    oledCommand(0x00);
+    oledCommand(0x10);
+
+    for (uint8_t blk = 0; blk < 16; ++blk) {
+      Wire.beginTransmission(OLED_ADDR);
+      Wire.write(0x40);
+      for (uint8_t b = 0; b < 8; ++b) {
+        Wire.write(oledBuffer[page * 128 + blk * 8 + b]);
+      }
+      Wire.endTransmission();
+    }
+  }
+}
+
+
+// ========================================================================================
+// BUZZER, LED, AND BUTTON MANAGEMENT
+// ========================================================================================
+void setLEDs(SystemState s) {
+  digitalWrite(LED_GREEN,  (s == STATE_NORMAL)   ? HIGH : LOW);
+  digitalWrite(LED_YELLOW, (s == STATE_INSECT)   ? HIGH : LOW);
+  digitalWrite(LED_RED,    (s == STATE_EXTERNAL) ? HIGH : LOW);
+}
+
+void updateBuzzer() {
+  uint32_t now = millis();
+
+  if (currentState == STATE_NORMAL || alarmMuted) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerPinState = false;
+    return;
+  }
+
+  uint32_t onTimeMs;
+  uint32_t offTimeMs;
+
+  if (currentState == STATE_INSECT) {
+    // Clearly audible repeating alarm for infestation.
+    onTimeMs = 300;
+    offTimeMs = 250;
+  } else {
+    // Faster pulse for external disturbance.
+    onTimeMs = 140;
+    offTimeMs = 140;
+  }
+
+  if (now >= buzzerNextToggleMs) {
+    buzzerPinState = !buzzerPinState;
+    digitalWrite(BUZZER_PIN, buzzerPinState ? HIGH : LOW);
+    buzzerNextToggleMs =
+        now + (buzzerPinState ? onTimeMs : offTimeMs);
+  }
+}
+
+void handleButton() {
+  static bool lastBtnState = HIGH;
+  bool nowState = digitalRead(BUTTON_PIN);
+  uint32_t now = millis();
+
+  if (lastBtnState == HIGH &&
+      nowState == LOW &&
+      (now - lastButtonPressMs > 250UL)) {
+
+    lastButtonPressMs = now;
+
+    if (currentState == STATE_INSECT ||
+        currentState == STATE_EXTERNAL ||
+        insectLatched) {
+
+      // Acknowledge current alarm and reset detection history.
+      currentState = STATE_NORMAL;
+      insectLatched = false;
+      insectConfirmCount = 0;
+      externalHoldUntil = 0;
+      alarmMuted = false;
+
+      memset(insectHistory, 0, sizeof(insectHistory));
+      historyIndex = 0;
+      recentInsectVotes = 0;
+
+      digitalWrite(BUZZER_PIN, LOW);
+      buzzerPinState = false;
+
+      Serial.println(F("[BUTTON] Alarm acknowledged and reset."));
+    } else {
+      alarmMuted = !alarmMuted;
+      Serial.print(F("[BUTTON] Alarm mute: "));
+      Serial.println(alarmMuted ? F("ON") : F("OFF"));
+    }
+  }
+
+  lastBtnState = nowState;
+}
+
+void startupSelfTest() {
+  Serial.println(F("--- STARTUP HARDWARE SELF-TEST ---"));
+
+  digitalWrite(BUZZER_PIN, LOW);
+
+  const uint8_t testPins[3] = {
+    LED_GREEN, LED_YELLOW, LED_RED
+  };
+
+  for (uint8_t i = 0; i < 3; i++) {
+    digitalWrite(testPins[i], HIGH);
+
+    // Two-stage pulse makes the buzzer easy to hear and verify.
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(120);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(80);
+
+    digitalWrite(testPins[i], LOW);
+  }
+
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(120);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  digitalWrite(LED_GREEN, HIGH);
+
+  buzzerPinState = false;
+  buzzerNextToggleMs = millis() + 100UL;
+
+  Serial.println(F("Self-test complete."));
+}
+
+// ========================================================================================
+// FAST IN-PLACE RADIX-2 COOLEY-TUKEY FFT
+// ========================================================================================
+void computeFFT(float *re, float *im, int n) {
+  int j = 0;
+  for (int i = 0; i < n - 1; i++) {
+    if (i < j) {
+      float tRe = re[i]; re[i] = re[j]; re[j] = tRe;
+      float tIm = im[i]; im[i] = im[j]; im[j] = tIm;
+    }
+    int k = n >> 1;
+    while (k <= j) {
+      j -= k;
+      k >>= 1;
+    }
+    j += k;
+  }
+
+  for (int len = 2; len <= n; len <<= 1) {
+    float ang = -2.0f * 3.14159265358979323846f / (float)len;
+    float wRe = cosf(ang);
+    float wIm = sinf(ang);
+    int half = len >> 1;
+    for (int i = 0; i < n; i += len) {
+      float curRe = 1.0f;
+      float curIm = 0.0f;
+      for (int k = 0; k < half; k++) {
+        int idx1 = i + k;
+        int idx2 = i + k + half;
+        float tRe = re[idx2] * curRe - im[idx2] * curIm;
+        float tIm = re[idx2] * curIm + im[idx2] * curRe;
+        re[idx2] = re[idx1] - tRe;
+        im[idx2] = im[idx1] - tIm;
+        re[idx1] += tRe;
+        im[idx1] += tIm;
+        float nextRe = curRe * wRe - curIm * wIm;
+        float nextIm = curRe * wIm + curIm * wRe;
+        curRe = nextRe;
+        curIm = nextIm;
+      }
+    }
+  }
+}
+
+// Synchronous interleaved sampling across P1, P2, and MIC
+void acquireWindow(int16_t *outP1, int16_t *outP2, int16_t *outMic, float &actualFs) {
+  uint32_t t0 = micros();
+
+  for (uint16_t i = 0; i < WINDOW_SIZE; i++) {
+    outP1[i]  = (int16_t)analogRead(P1_PIN);
+    outP2[i]  = (int16_t)analogRead(P2_PIN);
+    outMic[i] = (int16_t)analogRead(MIC_PIN);
+
+    // Keep buzzer and button actively serviced during ADC sampling
+    if ((i & 0x0F) == 0) {
+      updateBuzzer();
+      handleButton();
+    }
+  }
+
+  uint32_t t1 = micros();
+  uint32_t elapsed = t1 - t0;
+  if (elapsed < 1000) elapsed = 1000;
+  actualFs = (float)WINDOW_SIZE * 1000000.0f / (float)elapsed;
+}
+
+
+// ========================================================================================
+// FEATURE EXTRACTION (TIME-DOMAIN + SPECTRAL + BURST SEGMENTATION)
+// ========================================================================================
+void extractChannelFeatures(const int16_t *raw, float &baseline, float noiseFloor,
+                             float binWidthHz, ChannelFeatures &feat) {
+  // First find the actual DC level in THIS window.
+  // This makes the detector respond quickly if the container/probe orientation
+  // or mechanical loading changes suddenly.
+  double rawSum = 0.0;
+
+  for (uint16_t i = 0; i < WINDOW_SIZE; ++i) {
+    rawSum += (double)raw[i];
+  }
+
+  float windowMean = (float)(rawSum / (double)WINDOW_SIZE);
+  float dcShift = fabsf(windowMean - baseline);
+
+  double sumDevSq = 0.0;
+  double sumDev = 0.0;
+  float maxDev = 0.0f;
+
+  const float eventThreshold =
+      (noiseFloor * 2.4f > 5.0f) ? (noiseFloor * 2.4f) : 5.0f;
+  const float releaseThreshold = eventThreshold * 0.55f;
+
+  bool inEvent = false;
+  uint16_t eventCount = 0;
+  uint16_t eventTotalSamples = 0;
+  uint16_t quietGapSamples = 0;
+  uint16_t gapSumSamples = 0;
+  uint16_t gapCount = 0;
+
+  for (uint16_t i = 0; i < WINDOW_SIZE; ++i) {
+    float dev = fabsf((float)raw[i] - windowMean);
+
+    sumDev += dev;
+    sumDevSq += (double)dev * (double)dev;
+
+    if (dev > maxDev) maxDev = dev;
+
+    // Count separated bursts, not every sample above threshold.
+    if (!inEvent) {
+      if (dev >= eventThreshold) {
+        inEvent = true;
+        eventCount++;
+        quietGapSamples = 0;
+      }
+    } else {
+      if (dev < releaseThreshold) {
+        quietGapSamples++;
+        if (quietGapSamples >= 3) {
+          inEvent = false;
+          gapCount++;
+          gapSumSamples += quietGapSamples;
+          quietGapSamples = 0;
+        }
+      } else {
+        quietGapSamples = 0;
+        eventTotalSamples++;
+      }
+    }
+
+    fftRe[i] = ((float)raw[i] - windowMean) * hannWindow[i];
+    fftIm[i] = 0.0f;
+  }
+
+  feat.mean = windowMean;
+  feat.rms = sqrtf((float)(sumDevSq / (double)WINDOW_SIZE));
+  feat.peak = maxDev;
+  feat.crest = feat.peak / (feat.rms + EPS);
+  feat.activity = feat.rms / (noiseFloor + EPS);
+
+  feat.events = eventCount;
+  feat.eventDuration =
+      (eventCount > 0) ?
+      ((float)eventTotalSamples / (float)eventCount) : 0.0f;
+  feat.eventInterval =
+      (gapCount > 0) ?
+      ((float)gapSumSamples / (float)gapCount) : 0.0f;
+
+  // Fast baseline adaptation for a genuine DC shift, slow adaptation during
+  // vibration so actual events are not absorbed immediately.
+  if (feat.rms < noiseFloor * 2.0f + 3.0f) {
+    if (dcShift > 20.0f) {
+      baseline = baseline * 0.50f + windowMean * 0.50f;
+    } else {
+      baseline = baseline * 0.95f + windowMean * 0.05f;
+    }
+  } else {
+    baseline = baseline * 0.995f + windowMean * 0.005f;
+  }
+
+  computeFFT(fftRe, fftIm, FFT_SIZE);
+
+  float totalEnergy = 0.0f;
+  float maxMag = 0.0f;
+  int maxBin = 1;
+  float numCentroid = 0.0f;
+  float denCentroid = 0.0f;
+
+  float energyLow = 0.0f;
+  float energyMid = 0.0f;
+  float energyHigh = 0.0f;
+
+  for (int k = 1; k <= (int)FFT_HALF; ++k) {
+    float mag = sqrtf(fftRe[k] * fftRe[k] + fftIm[k] * fftIm[k]);
+    fftMag[k] = mag;
+
+    float power = mag * mag;
+    totalEnergy += power;
+
+    if (mag > maxMag) {
+      maxMag = mag;
+      maxBin = k;
+    }
+
+    float freqHz = (float)k * binWidthHz;
+    numCentroid += freqHz * mag;
+    denCentroid += mag;
+
+    if (k <= 15) {
+      energyLow += power;
+    } else if (k <= 35) {
+      energyMid += power;
+    } else {
+      energyHigh += power;
+    }
+  }
+
+  feat.specEnergy = totalEnergy;
+  feat.dominantFreq = (float)maxBin * binWidthHz;
+  feat.centroid = numCentroid / (denCentroid + EPS);
+
+  float numSpread = 0.0f;
+  for (int k = 1; k <= (int)FFT_HALF; ++k) {
+    float freqHz = (float)k * binWidthHz;
+    float diff = freqHz - feat.centroid;
+    numSpread += (diff * diff) * fftMag[k];
+  }
+
+  feat.spread = sqrtf(numSpread / (denCentroid + EPS));
+  feat.bandLow = energyLow;
+  feat.bandMid = energyMid;
+  feat.bandHigh = energyHigh;
+}
+
+// ========================================================================================
+// SENSOR BASELINE AND NOISE FLOOR CALIBRATION
+// ========================================================================================
+void calibrateSystem() {
+  Serial.println(F("CALIBRATING SENSORS: keep container completely still & quiet..."));
+
+  oledClear();
+  oledText(0, 0,  "GRAIN MONITOR");
+  oledText(0, 16, "CALIBRATING...");
+  oledText(0, 32, "KEEP STILL & QUIET");
+  oledText(0, 48, "CDAC VEGA V2");
+  oledShow();
+
+  double sumP1 = 0.0;
+  double sumP2 = 0.0;
+  double sumMic = 0.0;
+
+  for (uint16_t i = 0; i < CAL_SAMPLES; i++) {
+    sumP1  += (double)analogRead(P1_PIN);
+    sumP2  += (double)analogRead(P2_PIN);
+    sumMic += (double)analogRead(MIC_PIN);
+    delay(4);
+  }
+
+  baseP1  = (float)(sumP1  / (double)CAL_SAMPLES);
+  baseP2  = (float)(sumP2  / (double)CAL_SAMPLES);
+  baseMic = (float)(sumMic / (double)CAL_SAMPLES);
+
+  double sumSqP1 = 0.0;
+  double sumSqP2 = 0.0;
+  double sumSqMic = 0.0;
+
+  for (uint16_t i = 0; i < CAL_SAMPLES; i++) {
+    float d1 = (float)analogRead(P1_PIN)  - baseP1;
+    float d2 = (float)analogRead(P2_PIN)  - baseP2;
+    float dm = (float)analogRead(MIC_PIN) - baseMic;
+    sumSqP1  += (double)d1 * (double)d1;
+    sumSqP2  += (double)d2 * (double)d2;
+    sumSqMic += (double)dm * (double)dm;
+    delay(4);
+  }
+
+  noiseFloorP1  = sqrtf((float)(sumSqP1  / (double)CAL_SAMPLES));
+  noiseFloorP2  = sqrtf((float)(sumSqP2  / (double)CAL_SAMPLES));
+  noiseFloorMic = sqrtf((float)(sumSqMic / (double)CAL_SAMPLES));
+
+  if (noiseFloorP1  < 2.0f) noiseFloorP1  = 2.0f;
+  if (noiseFloorP2  < 2.0f) noiseFloorP2  = 2.0f;
+  if (noiseFloorMic < 2.0f) noiseFloorMic = 2.0f;
+
+  quietEnergyP1  = (noiseFloorP1 * noiseFloorP1) * (float)WINDOW_SIZE * 0.4f;
+  quietEnergyP2  = (noiseFloorP2 * noiseFloorP2) * (float)WINDOW_SIZE * 0.4f;
+  quietEnergyMic = (noiseFloorMic * noiseFloorMic) * (float)WINDOW_SIZE * 0.4f;
+
+  Serial.println(F("--- CALIBRATION RESULTS ---"));
+  Serial.print(F("Baseline: P1="));  Serial.print(baseP1, 1);
+  Serial.print(F(" P2="));           Serial.print(baseP2, 1);
+  Serial.print(F(" MIC="));          Serial.println(baseMic, 1);
+  Serial.print(F("NoiseRMS: P1="));  Serial.print(noiseFloorP1, 2);
+  Serial.print(F(" P2="));           Serial.print(noiseFloorP2, 2);
+  Serial.print(F(" MIC="));          Serial.println(noiseFloorMic, 2);
+}
+
+// ========================================================================================
+// SCORING ENGINE & DECISION LOGIC
+// ========================================================================================
+
+// Convert a score to a bounded confidence percentage.
+float clampPercent(float x) {
+  if (x < 0.0f) return 0.0f;
+  if (x > 100.0f) return 100.0f;
+  return x;
+}
+
+// A "burst" is deliberately separated by a quiet gap in extractChannelFeatures().
+// This prevents one container tap/ring-down from becoming dozens of events.
+void evaluateScores(const ChannelFeatures &f1, const ChannelFeatures &f2,
+                    const ChannelFeatures &fm, ScoreBreakdown &sc) {
+  const float p1Activity = f1.activity;
+  const float p2Activity = f2.activity;
+  const float micActivity = fm.activity;
+
+  const float p1PeakNorm = f1.peak / (noiseFloorP1 + EPS);
+  const float p2PeakNorm = f2.peak / (noiseFloorP2 + EPS);
+  const float micPeakNorm = fm.peak / (noiseFloorMic + EPS);
+
+  const float strongestProbeActivity =
+      (p1Activity > p2Activity) ? p1Activity : p2Activity;
+
+  const float weakestProbeActivity =
+      (p1Activity < p2Activity) ? p1Activity : p2Activity;
+
+  sc.spatialImbalance =
+      fabsf(f1.rms - f2.rms) / (f1.rms + f2.rms + 1.0f);
+
+  sc.probeRatio = (f1.rms + EPS) / (f2.rms + EPS);
+  sc.ambientDominance =
+      micActivity / (strongestProbeActivity + 0.25f);
+
+  // Activity threshold is RELATIVE to each channel's own calibrated floor.
+  // No fixed 0.7 V / fixed lower-probe threshold is used.
+  bool p1Active = (p1Activity >= 2.0f) || (p1PeakNorm >= 2.8f);
+  bool p2Active = (p2Activity >= 2.0f) || (p2PeakNorm >= 2.8f);
+  bool micActive = (micActivity >= 2.3f) || (micPeakNorm >= 3.0f);
+
+  bool oneProbeActive = p1Active || p2Active;
+  bool bothProbesActive = p1Active && p2Active;
+
+  // --------------------------------------------------------------------------
+  // INSECT EVIDENCE
+  // --------------------------------------------------------------------------
+  sc.temporal = 0.0f;
+  sc.spatial = 0.0f;
+  sc.spectral = 0.0f;
+  sc.ambientRejection = 0.0f;
+  sc.recurrence = 0.0f;
+
+  if (oneProbeActive) {
+    // Repeated separated bursts are strong evidence.
+    uint16_t events = (f1.events > f2.events) ? f1.events : f2.events;
+    if (events >= 1) sc.temporal += 8.0f;
+    if (events >= 2) sc.temporal += 10.0f;
+    if (events >= 3) sc.temporal += 12.0f;
+
+    // Reasonable event duration for small internal mechanical events.
+    float dur = (f1.events >= f2.events) ? f1.eventDuration : f2.eventDuration;
+    if (dur >= 1.0f && dur <= 18.0f) sc.temporal += 8.0f;
+
+    // Localized activity is important: do NOT require both probes to be active.
+    if (sc.spatialImbalance >= 0.12f) {
+      sc.spatial += 10.0f;
+    }
+    if (sc.spatialImbalance >= 0.25f) {
+      sc.spatial += 12.0f;
+    }
+    if (strongestProbeActivity > weakestProbeActivity * 1.35f) {
+      sc.spatial += 8.0f;
+    }
+
+    // Probe signal should dominate the ambient reference.
+    if (sc.ambientDominance < 1.0f) sc.ambientRejection += 8.0f;
+    if (sc.ambientDominance < 0.75f) sc.ambientRejection += 10.0f;
+    if (sc.ambientDominance < 0.55f) sc.ambientRejection += 8.0f;
+
+    // Spectral evidence is used as a supporting feature, not a single-frequency rule.
+    float highVsLow = (f1.bandHigh + f2.bandHigh + EPS) /
+                      (f1.bandLow + f2.bandLow + EPS);
+
+    if (highVsLow > 0.15f) sc.spectral += 6.0f;
+    if (f1.spread > 5.0f || f2.spread > 5.0f) sc.spectral += 5.0f;
+    if (f1.centroid > 10.0f || f2.centroid > 10.0f) sc.spectral += 4.0f;
+
+    // History is evaluated from previous decisions and then updated below.
+    sc.recurrence = ((float)recentInsectVotes / (float)HISTORY_LEN) * 25.0f;
+  }
+
+  sc.totalInsect =
+      sc.temporal +
+      sc.spatial +
+      sc.spectral +
+      sc.ambientRejection +
+      sc.recurrence;
+
+  // Strong simultaneous dual-probe + microphone impulses are specifically
+  // treated as external events, and are penalized as insect candidates.
+  if (bothProbesActive && micActive) {
+    sc.totalInsect -= 20.0f;
+  }
+
+  if (sc.totalInsect < 0.0f) sc.totalInsect = 0.0f;
+  if (sc.totalInsect > 100.0f) sc.totalInsect = 100.0f;
+
+  // --------------------------------------------------------------------------
+  // EXTERNAL DISTURBANCE EVIDENCE
+  // --------------------------------------------------------------------------
+  sc.impulse = 0.0f;
+  sc.simultaneousProbe = 0.0f;
+  sc.microphone = 0.0f;
+
+  float highestPeakNorm =
+      (p1PeakNorm > p2PeakNorm) ? p1PeakNorm : p2PeakNorm;
+
+  float highestCrest =
+      (f1.crest > f2.crest) ? f1.crest : f2.crest;
+
+  // Large short impulses are external candidates.
+  if (highestPeakNorm >= 5.0f) sc.impulse += 18.0f;
+  if (highestPeakNorm >= 8.0f) sc.impulse += 12.0f;
+  if (highestCrest >= 4.0f) sc.impulse += 8.0f;
+
+  // Similar response on both probes is a key touch/knock signature.
+  if (bothProbesActive) {
+    sc.simultaneousProbe += 25.0f;
+    if (sc.spatialImbalance < 0.25f) sc.simultaneousProbe += 20.0f;
+    if (sc.spatialImbalance < 0.12f) sc.simultaneousProbe += 10.0f;
+  }
+
+  // Microphone corroborates an environmental/container event.
+  if (micActive) {
+    sc.microphone += 20.0f;
+    if (micActivity >= 4.0f) sc.microphone += 8.0f;
+  }
+
+  // Repeated internal events make an external classification less likely.
+  float recurrencePenalty =
+      ((float)recentInsectVotes / (float)HISTORY_LEN) * 20.0f;
+
+  sc.totalExternal =
+      sc.impulse +
+      sc.simultaneousProbe +
+      sc.microphone -
+      recurrencePenalty;
+
+  // A microphone-only event is never external.
+  if (!oneProbeActive) {
+    sc.totalExternal = 0.0f;
+  }
+
+  if (sc.totalExternal < 0.0f) sc.totalExternal = 0.0f;
+  if (sc.totalExternal > 100.0f) sc.totalExternal = 100.0f;
+}
+
+float getCurrentConfidence() {
+  if (currentState == STATE_INSECT) {
+    return clampPercent(scores.totalInsect);
+  }
+  if (currentState == STATE_EXTERNAL) {
+    return clampPercent(scores.totalExternal);
+  }
+
+  float quiet = 100.0f - max(scores.totalInsect, scores.totalExternal);
+  return clampPercent(quiet);
+}
+
+void updateStateMachine(const ScoreBreakdown &sc) {
+  uint32_t now = millis();
+
+  // External events have priority and are held briefly so the jury can see them.
+  bool externalCandidate =
+      (sc.totalExternal >= 55.0f) &&
+      (sc.impulse >= 15.0f) &&
+      (sc.simultaneousProbe >= 25.0f);
+
+  if (externalCandidate) {
+    currentState = STATE_EXTERNAL;
+    externalHoldUntil = now + EXTERNAL_HOLD_MS;
+
+    // Clear current insect confirmation, but keep the history for analysis.
+    insectConfirmCount = 0;
+    insectLatched = false;
+    return;
+  }
+
+  if (now < externalHoldUntil) {
+    currentState = STATE_EXTERNAL;
+    return;
+  }
+
+  // Current-window insect candidate.
+  // Require a meaningful score AND at least one actual probe burst.
+  bool insectCandidate =
+      (sc.totalInsect >= 48.0f) &&
+      ((featP1.events >= 1) || (featP2.events >= 1));
+
+  // Update history.
+  insectHistory[historyIndex] = insectCandidate ? 1 : 0;
+  historyIndex = (uint8_t)((historyIndex + 1U) % HISTORY_LEN);
+
+  recentInsectVotes = 0;
+  for (uint8_t i = 0; i < HISTORY_LEN; i++) {
+    recentInsectVotes += insectHistory[i];
+  }
+
+  if (insectCandidate) {
+    if (insectConfirmCount < 10) insectConfirmCount++;
+  } else if (insectConfirmCount > 0) {
+    insectConfirmCount--;
+  }
+
+  // Insect detection requires recurrence, not one isolated hit.
+  // Either:
+  //   - 3 consecutive supporting windows, OR
+  //   - 4 of the last 8 windows are supporting.
+  if ((insectConfirmCount >= 3) || (recentInsectVotes >= 4)) {
+    insectLatched = true;
+    currentState = STATE_INSECT;
+    return;
+  }
+
+  // Once insect activity is identified, keep it visible until the button is
+  // pressed, so the jury does not miss a short detection.
+  if (insectLatched) {
+    currentState = STATE_INSECT;
+    return;
+  }
+
+  currentState = STATE_NORMAL;
+}
+
+// ========================================================================================
+// OLED SCREEN DISPLAY
+// ========================================================================================
+void updateOLED() {
+  oledClear();
+
+  oledText(0, 0, "GRAIN MONITOR");
+
+  if (alarmMuted) {
+    oledText(86, 0, "[MUTE]");
+  } else if (currentState == STATE_NORMAL) {
+    oledText(86, 0, "[NORM]");
+  } else if (currentState == STATE_INSECT) {
+    oledText(86, 0, "[WARN]");
+  } else {
+    oledText(86, 0, "[ALRT]");
+  }
+
+  oledText(0, 10, "STATE:");
+  if (currentState == STATE_NORMAL) {
+    oledText(38, 10, "NORMAL");
+  } else if (currentState == STATE_INSECT) {
+    oledText(38, 10, "INSECT ACTIVITY");
+  } else {
+    oledText(38, 10, "EXT DISTURBANCE");
+  }
+
+  oledText(0, 20, "P1:");
+  oledFloat(18, 20, featP1.rms, 1);
+
+  oledText(64, 20, "P2:");
+  oledFloat(82, 20, featP2.rms, 1);
+
+  oledText(0, 30, "MIC:");
+  oledFloat(24, 30, featMic.rms, 1);
+
+  oledText(64, 30, "SPAT:");
+  oledFloat(94, 30, scores.spatialImbalance, 2);
+
+  oledText(0, 40, "EV1:");
+  oledInt(24, 40, featP1.events);
+
+  oledText(64, 40, "EV2:");
+  oledInt(88, 40, featP2.events);
+
+  if (currentState == STATE_INSECT) {
+    oledText(0, 52, "CONF:");
+    oledInt(32, 52, (int)getCurrentConfidence());
+    oledText(52, 52, "%");
+    oledText(68, 52, "BUZZ:ON");
+  } else if (currentState == STATE_EXTERNAL) {
+    oledText(0, 52, "EXTERNAL NOISE");
+    oledText(90, 52, "BUZZ");
+  } else {
+    oledText(0, 52, "CONF:");
+    oledInt(32, 52, (int)getCurrentConfidence());
+    oledText(52, 52, "%");
+    oledText(68, 52, alarmMuted ? "BUZZ:MUTE" : "BUZZ:OFF");
+  }
+
+  oledShow();
+}
+
+// ========================================================================================
+// SERIAL MONITOR DIAGNOSTICS
+// ========================================================================================
+void printSerialDiagnostics() {
+  Serial.print(F("W#"));       Serial.print(windowCounter);
+  Serial.print(F(" | P1 RMS="));Serial.print(featP1.rms, 2);
+  Serial.print(F(" PK="));      Serial.print(featP1.peak, 1);
+  Serial.print(F(" EV1="));     Serial.print(featP1.events);
+
+  Serial.print(F(" | P2 RMS="));Serial.print(featP2.rms, 2);
+  Serial.print(F(" PK="));      Serial.print(featP2.peak, 1);
+  Serial.print(F(" EV2="));     Serial.print(featP2.events);
+
+  Serial.print(F(" | MIC RMS="));Serial.print(featMic.rms, 2);
+  Serial.print(F(" PK="));       Serial.print(featMic.peak, 1);
+
+  Serial.print(F(" | SPATIAL="));Serial.print(scores.spatialImbalance, 2);
+  Serial.print(F(" AMBIENT=")); Serial.print(scores.ambientDominance, 2);
+  Serial.print(F(" DOM1="));    Serial.print(featP1.dominantFreq, 0);
+  Serial.print(F("Hz"));
+
+  Serial.print(F(" | FS="));         Serial.print(effectiveSampleRate, 0);
+  Serial.print(F("Hz"));
+  Serial.print(F(" | INSECT="));  Serial.print(scores.totalInsect, 1);
+  Serial.print(F(" EXT="));       Serial.print(scores.totalExternal, 1);
+  Serial.print(F(" RECUR="));     Serial.print(recentInsectVotes);
+  Serial.print(F("/8"));
+
+  Serial.print(F(" | BUZZ="));
+  if (alarmMuted) {
+    Serial.print(F("MUTED"));
+  } else if (buzzerPinState) {
+    Serial.print(F("ON"));
+  } else {
+    Serial.print(F("OFF"));
+  }
+
+  Serial.print(F(" | STATE="));
+  if (currentState == STATE_NORMAL) {
+    Serial.println(F("NORMAL"));
+  } else if (currentState == STATE_INSECT) {
+    Serial.println(F("INSECT"));
+  } else {
+    Serial.println(F("EXTERNAL"));
+  }
+}
+
+// ========================================================================================
+// SETUP
+// ========================================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(250);
+
+  Serial.println(F("==========================================================="));
+  Serial.println(F("Offline Acoustic Detection of Hidden Insect Infestation"));
+  Serial.println(F("Platform: ARIES Vega V2.0 (CDAC RISC-V THEJAS)"));
+  Serial.println(F("==========================================================="));
+
+  pinMode(LED_GREEN,  OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+  pinMode(LED_RED,    OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(LED_GREEN,  LOW);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED,    LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  for (uint16_t i = 0; i < FFT_SIZE; i++) {
+    hannWindow[i] = 0.5f - 0.5f * cosf(2.0f * 3.14159265358979323846f * (float)i / (float)(FFT_SIZE - 1));
+  }
+
+  memset(insectHistory, 0, sizeof(insectHistory));
+
+  oledInit();
+  startupSelfTest();
+  calibrateSystem();
+
+  setLEDs(STATE_NORMAL);
+  updateOLED();
+
+  Serial.println(F("System initialized and monitoring."));
+  Serial.println(F("A0=P1 (Lower) | A1=P2 (Upper) | A2=MIC (Ambient)"));
+}
+
+// ========================================================================================
+// MAIN LOOP
+// ========================================================================================
+void loop() {
+  windowCounter++;
+
+  handleButton();
+  acquireWindow(bufP1, bufP2, bufMic, effectiveSampleRate);
+
+  float binWidthHz = effectiveSampleRate / (float)FFT_SIZE;
+
+  extractChannelFeatures(bufP1,  baseP1,  noiseFloorP1,  binWidthHz, featP1);
+  extractChannelFeatures(bufP2,  baseP2,  noiseFloorP2,  binWidthHz, featP2);
+  extractChannelFeatures(bufMic, baseMic, noiseFloorMic, binWidthHz, featMic);
+
+  // Slow quiet-only DC baseline tracking.
+  // This follows genuine drift without using a fixed voltage threshold.
+  if (featP1.rms < noiseFloorP1 * 1.25f) {
+    double avg = 0.0;
+    for (uint16_t i = 0; i < WINDOW_SIZE; i++) avg += bufP1[i];
+    baseP1 = baseP1 * 0.98f +
+             ((float)(avg / (double)WINDOW_SIZE)) * 0.02f;
+  }
+
+  if (featP2.rms < noiseFloorP2 * 1.25f) {
+    double avg = 0.0;
+    for (uint16_t i = 0; i < WINDOW_SIZE; i++) avg += bufP2[i];
+    baseP2 = baseP2 * 0.98f +
+             ((float)(avg / (double)WINDOW_SIZE)) * 0.02f;
+  }
+
+  if (featMic.rms < noiseFloorMic * 1.25f) {
+    double avg = 0.0;
+    for (uint16_t i = 0; i < WINDOW_SIZE; i++) avg += bufMic[i];
+    baseMic = baseMic * 0.98f +
+              ((float)(avg / (double)WINDOW_SIZE)) * 0.02f;
+  }
+
+  evaluateScores(featP1, featP2, featMic, scores);
+  updateStateMachine(scores);
+
+  setLEDs(currentState);
+  updateBuzzer();
+
+  uint32_t nowMs = millis();
+  if (nowMs - lastOLEDUpdateMs >= OLED_UPDATE_MS) {
+    lastOLEDUpdateMs = nowMs;
+    updateOLED();
+  }
+
+  printSerialDiagnostics();
+}
+
